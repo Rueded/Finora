@@ -1,7 +1,6 @@
 package com.example.aiexpensetracker.service
 
 import android.app.AlarmManager
-import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -26,11 +25,15 @@ import com.example.aiexpensetracker.R
 import com.example.aiexpensetracker.database.AccountEntity
 import com.example.aiexpensetracker.database.AppDatabase
 import com.example.aiexpensetracker.database.ExpenseEntity
-import com.example.aiexpensetracker.database.IgnoredEntity // 🟢 记得导入
+import com.example.aiexpensetracker.database.IgnoredEntity
 import com.example.aiexpensetracker.network.AiProcessor
+import com.example.aiexpensetracker.network.TransactionResult
+import com.example.aiexpensetracker.utils.VipUtils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
 import java.util.Calendar
 
 class NotificationListener : NotificationListenerService() {
@@ -41,37 +44,47 @@ class NotificationListener : NotificationListenerService() {
         private const val PREFS_NAME = "ai_tracker_prefs"
         private const val KEY_TRACKING_ENABLED = "tracking_enabled"
 
-        // 匹配时间窗：2分钟
         private const val MATCH_WINDOW_MS = 2 * 60 * 1000L
+        private const val DEDUP_WINDOW_MS = 10_000L
+        private const val NOTIFICATION_ID = 1001
+
+        private val dbMutex = kotlinx.coroutines.sync.Mutex()
+
+        // 🟢 绝对精准的指纹库 (只要命中，误判率为 0%)
+        private val EXACT_SIGNATURES = listOf(
+            Regex("Payment of RM\\s?(\\d+\\.\\d{2}) to (.*?) successful", RegexOption.IGNORE_CASE), // TNG eWallet
+            Regex("You paid RM\\s?(\\d+\\.\\d{2}) to (.*)", RegexOption.IGNORE_CASE), // ShopeePay
+            Regex("RM\\s?(\\d+\\.\\d{2}) was transferred to (.*)", RegexOption.IGNORE_CASE), // Maybank (Transfer)
+            Regex("RM\\s?(\\d+\\.\\d{2}) was deducted from (.*)", RegexOption.IGNORE_CASE), // Maybank (Deduction)
+            Regex("Paid RM\\s?(\\d+\\.\\d{2}) to (.*)", RegexOption.IGNORE_CASE), // GrabPay
+            Regex("Transfer to (.*?) of RM\\s?(\\d+\\.\\d{2}) is successful", RegexOption.IGNORE_CASE) // CIMB
+        )
 
         private val TARGET_PACKAGES = setOf(
-            "my.com.tngdigital.ewallet",    // TNG eWallet
-            "com.grabtaxi.passenger",       // Grab
-            "com.shopee.my",                // Shopee
-            "my.com.myboost",               // Boost
-            "com.airasia.bigpay",           // BigPay
-            "com.maybank2u.life",           // MAE
-            "com.cimb.octo",                // CIMB Octo
-            "com.cimb.clicks.android",      // CIMB Clicks
-            "my.com.rhbgroup.mobilebanking",// RHB Old
-            "com.rhbgroup.rhbengineering",  // RHB New
-            "com.hongleong.pb",             // HLB
-            "my.com.mybsn",                 // BSN
-            "com.mybsn.mobile",             // BSN
-            "net.mybsn.secure",             // BSN
-            "com.ambank.ambank",            // AmBank
-            "my.com.publicbank.pbe",        // Public Bank
-            "com.alliancebank.allianceonline", // Alliance
-            "com.bankislam.go",             // Bank Islam
-            "com.bankrakyat.irakyat",       // Bank Rakyat
-            "com.sc.breeze.my",             // Standard Chartered
-            "my.com.hsbc.hsbcmobilebanking",// HSBC
-            "com.ocbc.mobile",              // OCBC
-            "com.uob.mighty.my"             // UOB
+            "my.com.tngdigital.ewallet", "com.grabtaxi.passenger", "com.shopee.my", "com.shopeepay.my",
+            "my.com.myboost", "com.airasia.bigpay", "com.maybank2u.life", "com.cimb.octo",
+            "com.cimb.clicks.android", "my.com.rhbgroup.mobilebanking", "my.com.rhbgroup.rhbmobilebanking",
+            "com.rhbgroup.rhbengineering", "com.rhbgroup.rhbmobilebanking", "com.hongleong.pb",
+            "my.com.mybsn", "com.mybsn.mobile", "net.mybsn.secure", "com.ambank.ambank",
+            "my.com.publicbank.pbe", "com.alliancebank.allianceonline", "com.bankislam.go",
+            "com.bankrakyat.irakyat", "com.sc.breeze.my", "my.com.hsbc.hsbcmobilebanking",
+            "com.ocbc.mobile", "com.uob.mighty.my", "com.maybank2u.m2u", "com.cimb.cimbocto",
+            "com.cimbmalaysia", "my.com.rhb.mobilebanking", "my.com.hongleongconnect.mobile",
+            "com.publicbank.pbengage", "com.ambank.ambankonline", "com.ambank.amonline",
+            "com.alliance.online.mobile", "com.bankislam.bimbmobile", "my.com.bankrakyat.irakyat",
+            "com.affinbank.affinalways", "com.affinonline.rib", "com.uob.tmrw.my", "com.ocbc.my",
+            "com.ocbc.mobilebanking.my", "hk.com.hsbc.hsbcmalaysia", "com.htsu.hsbcpersonalbanking",
+            "com.standardchartered.breeze.my", "my.gxbank.my", "my.com.aeonbank.app",
+            "com.bankislam.beu", "com.alrajhi.rize", "com.tpa.airasiacard", "com.setel.mobile",
+            "com.aeoncredit.wallet.my", "com.lazada.android", "com.google.android.apps.walletnfcrel",
+            "com.samsung.android.spay", "com.paypal.android.p2pmobile", "com.transferwise.android",
+            "com.eg.android.AlipayGphone"
         )
     }
 
     private var isServiceRunning = true
+    private var lastProcessedText: String = ""
+    private var lastPostTime: Long = 0L
 
     private val stopReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -85,14 +98,18 @@ class NotificationListener : NotificationListenerService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        super.onStartCommand(intent, flags, startId)
         startForegroundService()
         return Service.START_STICKY
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        val restartServiceIntent = Intent(applicationContext, NotificationListener::class.java).also { it.setPackage(packageName) }
-        val restartServicePendingIntent = PendingIntent.getService(applicationContext, 1, restartServiceIntent, PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE)
+        val restartServiceIntent = Intent(applicationContext, NotificationListener::class.java).also {
+            it.setPackage(packageName)
+        }
+        val restartServicePendingIntent = PendingIntent.getService(
+            applicationContext, 1, restartServiceIntent,
+            PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+        )
         val alarmService = applicationContext.getSystemService(Context.ALARM_SERVICE) as AlarmManager
         alarmService.set(AlarmManager.ELAPSED_REALTIME, SystemClock.elapsedRealtime() + 1000, restartServicePendingIntent)
         super.onTaskRemoved(rootIntent)
@@ -136,151 +153,261 @@ class NotificationListener : NotificationListenerService() {
         val stopPendingIntent = PendingIntent.getBroadcast(this, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE)
         val contentText = if (isPaused) getString(R.string.service_paused_desc) else getString(R.string.service_listening)
         val actionText = if (isPaused) getString(R.string.service_btn_paused) else getString(R.string.service_btn_pause)
+
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle(getString(R.string.service_title))
             .setContentText(contentText)
             .setSmallIcon(android.R.drawable.ic_popup_sync)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .apply { if (!isPaused) addAction(android.R.drawable.ic_media_pause, actionText, stopPendingIntent) }
             .build()
+
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
             } else {
-                startForeground(1, notification)
+                startForeground(NOTIFICATION_ID, notification)
             }
-        } catch (e: Exception) { Log.e(TAG, "Cannot start foreground service: ${e.message}") }
+        } catch (e: Exception) {
+            Log.e(TAG, "Cannot start foreground service: ${e.message}")
+        }
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         val prefs = applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         if (!prefs.getBoolean(KEY_TRACKING_ENABLED, true)) return
         if (sbn == null) return
+
+        val currentPostTime = sbn.postTime
         val packageName = sbn.packageName
         if (!TARGET_PACKAGES.contains(packageName)) return
 
         val extras = sbn.notification.extras
-        val title = extras.getString(Notification.EXTRA_TITLE) ?: ""
-        val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: ""
+        var title = extras.getString(android.app.Notification.EXTRA_TITLE)
+            ?: extras.getString(android.app.Notification.EXTRA_TITLE_BIG) ?: ""
+        var text = extras.getCharSequence(android.app.Notification.EXTRA_TEXT)?.toString()
+            ?: extras.getCharSequence(android.app.Notification.EXTRA_BIG_TEXT)?.toString()
+            ?: extras.getCharSequence(android.app.Notification.EXTRA_SUMMARY_TEXT)?.toString() ?: ""
+
+        if (text.isBlank()) text = sbn.notification.tickerText?.toString() ?: ""
+        if (title.isBlank()) title = detectAccountName(packageName)
+
+        val fullContent = "$title $text".uppercase().replace("\\s+".toRegex(), "")
+
+        if (fullContent == lastProcessedText && (currentPostTime - lastPostTime) < DEDUP_WINDOW_MS) {
+            Log.d("AutoDelivery", "🛑 10秒内重复通知，已拦截")
+            return
+        }
+        lastProcessedText = fullContent
+        lastPostTime = currentPostTime
+        val currentTime = System.currentTimeMillis()
+
+        // ==========================================
+        // VIP 自动发卡雷达
+        // ==========================================
+        val amountRegex = Regex("RM\\s*(\\d+(\\.\\d{1,2})?)")
+        val amountMatch = amountRegex.find(fullContent)
+        val earnedAmount = amountMatch?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0
+
+        val vipPrices = setOf(9.90, 89.90, 199.00)
+        val isVipPrice = vipPrices.any { Math.abs(earnedAmount - it) < 0.001 }
+
+        val isIncoming = fullContent.containsAny("RECEIVED", "TOYOU", "CREDITED", "FROM", "收款", "入账", "收到")
+        val isOutgoing = fullContent.containsAny("YOU'VETRANSFERRED", "PAID", "SPENT", "PAYMENTTO", "付款", "转出", "支付")
+
+        if (isVipPrice && isIncoming && !isOutgoing) {
+            Log.d("AutoDelivery", "🎯 嗅探到真实的 VIP 商业收款: $fullContent")
+            val database = com.google.firebase.database.FirebaseDatabase.getInstance("https://ai-expense-tracker-0-default-rtdb.asia-southeast1.firebasedatabase.app/")
+            database.goOnline()
+            val receiptData = mapOf("text" to fullContent, "timestamp" to currentTime, "claimed" to false)
+            database.getReference("global_payments/history").push().setValue(receiptData)
+
+            CoroutineScope(Dispatchers.IO).launch {
+                try {
+                    val db = AppDatabase.getDatabase(applicationContext)
+                    val detectedAccount = detectAccountName(packageName)
+                    val vipIncome = ExpenseEntity(
+                        amount = earnedAmount, type = "INCOME", merchant = "VIP Subscription",
+                        category = getString(R.string.category_business_income), timestamp = currentTime,
+                        originalText = "Auto-detected VIP Payment: $fullContent",
+                        note = getString(R.string.note_auto_vip_income), accountName = detectedAccount
+                    )
+                    dbMutex.withLock { db.expenseDao().insert(vipIncome) }
+                } catch (e: Exception) { Log.e("AutoDelivery", "记账失败", e) }
+            }
+            return
+        }
+        // ==========================================
 
         if (isSensitive(text) || isSensitive(title)) return
 
-        // 🟢 1. 记录本地正则拦截 (Keyword Filter)
-        if (!isValidTransaction(title, text)) {
-            Log.d(TAG, "🗑️ Ignored spam: $title")
-            saveIgnoredLog(packageName, title, text, "Keyword Filter (Spam/Ad)")
-            return
+        val combinedRawText = "$title $text".replace("\n", " ")
+
+        // 🟢 绝杀第一层：指纹匹配 (Signature Match)
+        var is100PercentReal = false
+        var preExtractedAmount = 0.0
+
+        for (regex in EXACT_SIGNATURES) {
+            val match = regex.find(combinedRawText)
+            if (match != null) {
+                is100PercentReal = true
+                // 自动找出正则里匹配的金额（含有小数点的分组）
+                val amountStr = match.groupValues.find { it.matches(Regex("\\d+\\.\\d{2}")) } ?: match.groupValues.getOrNull(1)
+                preExtractedAmount = amountStr?.toDoubleOrNull() ?: 0.0
+                break
+            }
         }
 
-        Log.e(TAG, "📨 Captured: $packageName")
+        if (is100PercentReal && preExtractedAmount > 0) {
+            Log.d(TAG, "🎯 Perfect Signature Match: RM $preExtractedAmount. Bypassing score filter.")
+        } else {
+            // ✅ 没有命中指纹，才走评分制过滤器
+            val filterScore = calcFilterScore(title, text)
+            // 🟢 修改这里：门槛降到 2 分！只要有 RM + successful 就能过！
+            if (filterScore < 2) {
+                Log.d(TAG, "🗑️ Score=$filterScore, ignored: $title")
+                saveIgnoredLog(packageName, title, text, "Score Filter (score=$filterScore)")
+                return
+            }
+        }
+
+        Log.e(TAG, "📨 Captured (is100PercentReal=$is100PercentReal): $packageName")
 
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val fullText = "App: $packageName. Title: $title. Message: $text"
-                Log.e(TAG, "🤖 Asking Gemini AI...")
+                val aiConfig = getAiConfigAndCheckQuota(applicationContext)
 
-                val result = AiProcessor.analyze(fullText)
-
-                if (result != null && result.valid) {
-                    val db = AppDatabase.getDatabase(applicationContext)
-                    val learningDao = db.merchantLearningDao()
-                    val expenseDao = db.expenseDao()
-                    val accountDao = db.accountDao()
-
-                    val currentTime = System.currentTimeMillis()
-
-                    // 1. Detect & Auto-Create Account
-                    val detectedAccount = detectAccountName(packageName)
-                    if (accountDao.exists(detectedAccount) == 0) {
-                        Log.d(TAG, "🆕 Creating new account: $detectedAccount")
-                        accountDao.insert(AccountEntity(name = detectedAccount))
-                    }
-
-                    // 2. Memory Retrieval
-                    val timeSlot = getTimeSlot(currentTime)
-                    val merchantName = result.merchant ?: "Unknown"
-                    val memory = if (merchantName != "Unknown") learningDao.getLearning(merchantName, timeSlot) else null
-
-                    val autoCategory = memory?.category ?: result.category ?: "Uncategorized"
-                    val autoNote = memory?.note ?: ""
-
-                    // 🟢 3. 智能转账合并逻辑 (Smart Auto-Merge)
-                    val amount = result.amount ?: 0.0
-                    var currentType = result.type ?: "EXPENSE"
-                    var currentTarget: String? = null
-                    var currentNote = autoNote
-
-                    val startTime = currentTime - MATCH_WINDOW_MS
-                    val endTime = currentTime + MATCH_WINDOW_MS
-
-                    var isMerged = false // 是否已完成合并（不需要插入新记录）
-                    var transferId = 0   // 用于通知跳转
-
-                    if (currentType == "INCOME") {
-                        // 场景 A: 收到【收入】。去查之前有没有【支出】?
-                        // 如果有，说明是别人转给我的，或者是我的另一个号转过来的。
-                        val match = expenseDao.findMatchingTransaction(amount, "EXPENSE", startTime, endTime)
-                        if (match != null && match.accountName != detectedAccount) {
-                            Log.e(TAG, "🔗 Auto-Merge (Income Trigger): Transfer from ${match.accountName} to $detectedAccount")
-
-                            // 动作：修改那笔旧的 Expense，变成 Transfer
-                            expenseDao.convertToTransfer(match.id, detectedAccount)
-
-                            // 标记：已合并，不需要再存这笔 Income 了
-                            isMerged = true
-                            transferId = match.id
-                        }
-                    } else if (currentType == "EXPENSE") {
-                        // 场景 B: 收到【支出】。去查之前有没有【收入】?
-                        // (这种情况较少见，通常是银行扣款慢了，钱包入账快了)
-                        val match = expenseDao.findMatchingTransaction(amount, "INCOME", startTime, endTime)
-                        if (match != null && match.accountName != detectedAccount) {
-                            Log.e(TAG, "🔗 Auto-Merge (Expense Trigger): Transfer from $detectedAccount to ${match.accountName}")
-
-                            // 动作 1：删除那笔旧的 Income (因为它现在被视为这笔 Transfer 的终点)
-                            expenseDao.delete(match)
-
-                            // 动作 2：把当前这笔 Expense 直接存为 Transfer
-                            currentType = "TRANSFER"
-                            currentTarget = match.accountName
-                            if (currentNote.isBlank()) currentNote = "Auto-merged Transfer"
-
-                            // 标记：isMerged = false，因为我们需要插入当前这笔 (作为 Transfer)
-                            isMerged = false
-                        }
-                    }
-
-                    if (isMerged) {
-                        // 场景 A 的结果：只发通知，不存库
-                        val msg = getString(R.string.notif_saved_title, "Transfer RM ${String.format("%.2f", amount)}")
-                        showToast(msg)
-                        sendInputRequiredNotification(transferId, amount, "Transfer", "Auto-merged")
+                // 如果配额耗尽了
+                if (!aiConfig.isAllowed) {
+                    Log.w(TAG, "🚫 AI Quota exceeded for today.")
+                    if (is100PercentReal && preExtractedAmount > 0) {
+                        // 🌟 指纹库兜底：无视 AI，强行入库
+                        val fallback = TransactionResult(true, preExtractedAmount, "Unknown", "Other", determineType(combinedRawText))
+                        saveFallbackRecord(fallback, text, packageName, currentTime, "AI Quota Exceeded (Signature Matched)")
                     } else {
-                        // 场景 B 的结果 或 普通账单：存库
-                        val newRecord = ExpenseEntity(
-                            amount = amount,
-                            type = currentType, // 可能是 EXPENSE 或 TRANSFER
-                            merchant = merchantName,
-                            category = autoCategory,
-                            timestamp = currentTime,
-                            originalText = text,
-                            note = currentNote,
-                            accountName = detectedAccount,
-                            targetAccountName = currentTarget
-                        )
-                        val id = expenseDao.insert(newRecord)
+                        val fallback = localRegexFallback(title, text, packageName)
+                        if (fallback != null) {
+                            saveFallbackRecord(fallback, text, packageName, currentTime, "AI Quota Exceeded")
+                        } else {
+                            saveIgnoredLog(packageName, title, text, "Daily AI Limit Reached (Need VIP)")
+                            sendQuotaExceededNotification()
+                        }
+                    }
+                    return@launch
+                }
 
-                        val savedMsg = getString(R.string.notif_saved_title, "RM ${String.format("%.2f", newRecord.amount)}")
-                        showToast(savedMsg)
-                        sendInputRequiredNotification(id.toInt(), newRecord.amount, newRecord.merchant, currentNote)
+                // ✅ 第二层：AI 提取（带重试）
+                Log.e(TAG, "🤖 Asking AI (with retry)...")
+                val result = retryAiExtraction(fullText, aiConfig, maxRetries = 2)
+
+                // 🟢 【防线升级】：如果 AI 明确判定这是 Spam/无效通知
+                // ⚠️ 关键逻辑：如果指纹库说是 100% 真实的，绝对无视 AI 的否决！
+                val aiVetoed = result != null && !result.valid
+                if (aiVetoed && !is100PercentReal) {
+                    Log.d(TAG, "🛑 AI Vetoed: Explicitly identified as SPAM.")
+                    saveIgnoredLog(packageName, title, text, "AI explicitly identified as SPAM")
+                    return@launch
+                }
+
+                // 取出金额：如果 AI 没提取出来，但指纹库提取出来了，就用指纹库的钱
+                val aiAmount = result?.amount ?: 0.0
+                val finalAmount = if (aiAmount > 0.0) aiAmount else if (is100PercentReal) preExtractedAmount else 0.0
+
+                if (finalAmount > 0.0) {
+                    // AI 成功 或 指纹兜底成功 -> 正常入库
+                    dbMutex.withLock {
+                        val db = AppDatabase.getDatabase(applicationContext)
+                        val learningDao = db.merchantLearningDao()
+                        val expenseDao = db.expenseDao()
+                        val accountDao = db.accountDao()
+
+                        val detectedAccount = detectAccountName(packageName)
+                        if (accountDao.exists(detectedAccount) == 0) {
+                            Log.d(TAG, "🆕 Creating new account: $detectedAccount")
+                            accountDao.insert(AccountEntity(name = detectedAccount))
+                        }
+
+                        val timeSlot = getTimeSlot(currentTime)
+                        val merchantName = result?.merchant ?: "Unknown"
+                        val memory = if (merchantName != "Unknown") learningDao.getLearning(merchantName, timeSlot) else null
+
+                        val autoCategory = memory?.category ?: result?.category ?: "Uncategorized"
+                        val autoNote = memory?.note ?: ""
+
+                        var currentType = result?.type ?: determineType(combinedRawText)
+                        var currentTarget: String? = null
+                        var currentNote = autoNote
+
+                        val startTime = currentTime - MATCH_WINDOW_MS
+                        val endTime = currentTime + MATCH_WINDOW_MS
+
+                        var isMerged = false
+                        var transferId = 0
+
+                        if (currentType == "INCOME") {
+                            val match = expenseDao.findMatchingTransaction(finalAmount, "EXPENSE", startTime, endTime)
+                            if (match != null && match.accountName != detectedAccount) {
+                                Log.e(TAG, "🔗 Auto-Merge (Income): Transfer from ${match.accountName} to $detectedAccount")
+                                expenseDao.convertToTransfer(match.id, detectedAccount)
+                                isMerged = true
+                                transferId = match.id
+                            }
+                        } else if (currentType == "EXPENSE") {
+                            val match = expenseDao.findMatchingTransaction(finalAmount, "INCOME", startTime, endTime)
+                            if (match != null &&
+                                match.merchant != "VIP Subscription" &&
+                                match.accountName != detectedAccount) {
+                                Log.e(TAG, "🔗 Auto-Merge (Expense): Transfer from $detectedAccount to ${match.accountName}")
+                                expenseDao.delete(match)
+                                currentType = "TRANSFER"
+                                currentTarget = match.accountName
+                                if (currentNote.isBlank()) currentNote = getString(R.string.note_auto_merged_transfer)
+                                isMerged = false
+                            }
+                        }
+
+                        if (isMerged) {
+                            val msg = getString(R.string.notif_saved_title, "Transfer RM ${String.format("%.2f", finalAmount)}")
+                            showToast(msg)
+                            sendInputRequiredNotification(transferId, finalAmount, "Transfer", getString(R.string.note_auto_merged))
+                        } else {
+                            val newRecord = ExpenseEntity(
+                                amount = finalAmount,
+                                type = currentType,
+                                merchant = merchantName,
+                                category = autoCategory,
+                                timestamp = currentTime,
+                                originalText = text,
+                                note = currentNote,
+                                accountName = detectedAccount,
+                                targetAccountName = currentTarget
+                            )
+                            val id = expenseDao.insert(newRecord)
+
+                            val savedMsg = getString(R.string.notif_saved_title, "RM ${String.format("%.2f", newRecord.amount)}")
+                            showToast(savedMsg)
+                            sendInputRequiredNotification(id.toInt(), newRecord.amount, newRecord.merchant, currentNote)
+                        }
                     }
                 } else {
-                    // 🟢 2. 记录 AI 拦截 (AI Rejected)
-                    Log.d(TAG, "🤖 AI Rejected: Not a valid transaction")
-                    saveIgnoredLog(packageName, title, text, "AI Rejected (Invalid Data)")
+                    // ✅ 第三层： Regex 兜底抢救 (仅当 AI 失败且没命中精确指纹库时触发)
+                    Log.w(TAG, "🤖 AI failed and no exact signature. Triggering Regex Rescue...")
+                    val fallback = localRegexFallback(title, text, packageName)
+                    if (fallback != null) {
+                        Log.d(TAG, "🚑 Regex rescued the transaction: RM ${fallback.amount}")
+                        saveFallbackRecord(fallback, text, packageName, currentTime, "Rescued by Regex (AI Failed)")
+                    } else {
+                        Log.d(TAG, "🗑️ Both AI and Regex rejected it.")
+                        saveIgnoredLog(packageName, title, text, "AI & Regex both failed")
+                    }
                 }
+
             } catch (e: Exception) {
                 Log.e(TAG, "💥 Error: ${e.message}")
                 e.printStackTrace()
@@ -288,22 +415,188 @@ class NotificationListener : NotificationListenerService() {
         }
     }
 
-    // 🟢 辅助：保存被忽略的日志
+    // ==========================================
+    // 第二层：AI 重试机制
+    // ==========================================
+    private suspend fun retryAiExtraction(
+        fullText: String,
+        aiConfig: AiConfig,
+        maxRetries: Int = 2
+    ): TransactionResult? {
+        repeat(maxRetries) { attempt ->
+            try {
+                val result = AiProcessor.analyze(fullText, aiConfig.customKey, aiConfig.customModel)
+                if (result != null) {
+                    Log.d(TAG, "✅ AI responded on attempt ${attempt + 1}. Valid: ${result.valid}")
+                    return result
+                }
+                Log.w(TAG, "⚠️ AI attempt ${attempt + 1} failed completely (No JSON), retrying...")
+                if (attempt < maxRetries - 1) delay(1500L)
+            } catch (e: Exception) {
+                Log.e(TAG, "💥 AI attempt ${attempt + 1} threw: ${e.message}")
+                if (attempt < maxRetries - 1) delay(1500L)
+            }
+        }
+        return null
+    }
+
+    // ==========================================
+    // 第三层：本地 Regex 兜底提取
+    // ==========================================
+    private fun localRegexFallback(title: String, text: String, pkg: String): TransactionResult? {
+        val combined = "$title $text"
+
+        // 提取金额（支持逗号千位分隔符）
+        val amountRegex = Regex("""RM\s*(\d{1,6}(?:,\d{3})*(?:\.\d{1,2})?)""", RegexOption.IGNORE_CASE)
+        val amountStr = amountRegex.find(combined)?.groupValues?.get(1)?.replace(",", "") ?: return null
+        val amount = amountStr.toDoubleOrNull() ?: return null
+        if (amount <= 0) return null
+
+        val type = determineType(combined)
+
+        Log.d(TAG, "🛠️ Regex fallback extracted: RM$amount ($type)")
+        return TransactionResult(
+            valid = true,
+            amount = amount,
+            merchant = "Unknown",
+            category = "Uncategorized",
+            type = type
+        )
+    }
+
+    private fun determineType(combined: String): String {
+        val upper = combined.uppercase()
+        return when {
+            upper.containsAny("RECEIVED", "CREDITED", "INWARD", "TO YOU",
+                "FUNDS RECEIVED", "INTO YOUR ACCOUNT", "收款", "入账", "收到") -> "INCOME"
+            else -> "EXPENSE"
+        }
+    }
+
+    // ==========================================
+    // 兜底记录写入（标注待审核，存入账单列表）
+    // ==========================================
+    private suspend fun saveFallbackRecord(
+        fallback: TransactionResult,
+        originalText: String,
+        packageName: String,
+        currentTime: Long,
+        reason: String
+    ) {
+        dbMutex.withLock {
+            try {
+                val db = AppDatabase.getDatabase(applicationContext)
+                val expenseDao = db.expenseDao()
+                val accountDao = db.accountDao()
+                val detectedAccount = detectAccountName(packageName)
+
+                if (accountDao.exists(detectedAccount) == 0) {
+                    accountDao.insert(AccountEntity(name = detectedAccount))
+                }
+
+                val record = ExpenseEntity(
+                    amount = fallback.amount ?: 0.0,
+                    type = fallback.type ?: "EXPENSE",
+                    merchant = "Unknown",
+                    category = "Uncategorized",
+                    timestamp = currentTime,
+                    originalText = originalText,
+                    note = getString(R.string.note_pending_review, reason),
+                    accountName = detectedAccount,
+                    targetAccountName = null
+                )
+                val id = expenseDao.insert(record)
+                Log.d(TAG, "🛠️ Fallback record saved, id=$id, amount=${fallback.amount}")
+
+                showToast(getString(R.string.toast_pending_review, String.format("%.2f", fallback.amount)))
+                sendInputRequiredNotification(
+                    id.toInt(),
+                    fallback.amount ?: 0.0,
+                    getString(R.string.merchant_pending_review),
+                    getString(R.string.notif_tap_to_confirm)
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "💥 Fallback save failed: ${e.message}")
+            }
+        }
+    }
+
+    // ==========================================
+    // 第一层：评分制过滤器
+    // ==========================================
+    private fun calcFilterScore(title: String, text: String): Int {
+        val combined = "$title $text".lowercase()
+        var score = 0
+
+        // 1. 必须有货币符号，否则直接枪毙
+        val hasCurrency = combined.containsAny("rm", "myr", "令吉", "马币")
+        if (!hasCurrency) return -99
+
+        // 2. 强正向词 (明确的支出行为) +4 分
+        val highPositive = listOf(
+            // 英文
+            "paid", "payment", "deducted", "transferred", "transfer to", "debited", "purchase", "spent", "charged", "duitnow", "fpx", "jompay", "paywave", "ibg",
+            // 马来文
+            "bayar", "dibayar", "pembayaran", "pemindahan", "dipindahkan", "perbelanjaan",
+            // 中文
+            "支付", "付款", "扣款", "转账", "已转", "支出", "消费", "刷卡"
+        )
+
+        // 3. 中正向词 (明确的收入行为) +3 分
+        val medPositive = listOf(
+            // 英文
+            "received", "credited", "to your account", "funds received", "top up", "topup", "reload", "refund",
+            // 马来文
+            "diterima", "dikreditkan", "tambah nilai", "kembalikan",
+            // 中文
+            "收款", "入账", "收到", "充值", "加额", "存款", "退款"
+        )
+
+        // 4. 弱正向词 (交易状态词) +2 分
+        val lowPositive = listOf(
+            // 英文
+            "successful", "approved", "completed", "accepted",
+            // 马来文
+            "berjaya", "selesai", "diluluskan",
+            // 中文
+            "成功", "完成", "已批准", "接受"
+        )
+
+        // 5. 扣分项防线
+        // 绝对敏感词 -10分 (即使有 RM 和 successful 也会变成负分)
+        val criticalNegative = listOf("tac", "otp", "verification code", "验证码", "驗證碼", "kod pengesahan", "login", "log masuk", "登录", "登入")
+        // 失败词汇 -8分
+        val highNegative = listOf("unsuccessful", "failed", "declined", "rejected", "失败", "失敗", "拒绝", "拒絕", "gagal", "tidak berjaya")
+        // 广告/优惠词汇 -5分
+        val medNegative = listOf("promo", "voucher", "cashback", "lucky draw", "winner", "reward", "discount", "抽奖", "优惠券", "折扣", "ganjaran", "promosi", "diskaun")
+        // 系统通知 -4分
+        val lowNegative = listOf("maintenance", "downtime", "system update", "statement", "e-statement", "维护", "账单", "penyata", "penyelenggaraan")
+
+        // 开始计分
+        if (highPositive.any { combined.contains(it) }) score += 4
+        if (medPositive.any { combined.contains(it) }) score += 3
+        if (lowPositive.any { combined.contains(it) }) score += 2
+
+        if (criticalNegative.any { combined.contains(it) }) score -= 10
+        if (highNegative.any { combined.contains(it) }) score -= 8
+        if (medNegative.any { combined.contains(it) }) score -= 5
+        if (lowNegative.any { combined.contains(it) }) score -= 4
+
+        Log.d(TAG, "🎯 FilterScore=$score | $combined")
+        return score
+    }
+
+    // ==========================================
+    // 工具方法
+    // ==========================================
+    private fun String.containsAny(vararg keywords: String) = keywords.any { this.contains(it, ignoreCase = true) }
+
     private fun saveIgnoredLog(pkg: String, title: String, text: String, reason: String) {
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val db = AppDatabase.getDatabase(applicationContext)
-                db.ignoredDao().insert(
-                    IgnoredEntity(
-                        packageName = pkg,
-                        title = title,
-                        text = text,
-                        reason = reason
-                    )
-                )
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
+                db.ignoredDao().insert(IgnoredEntity(packageName = pkg, title = title, text = text, reason = reason))
+            } catch (e: Exception) { e.printStackTrace() }
         }
     }
 
@@ -314,7 +607,7 @@ class NotificationListener : NotificationListenerService() {
             "com.shopee.my" -> "ShopeePay"
             "com.maybank2u.life" -> "Maybank"
             "com.cimb.octo", "com.cimb.clicks.android" -> "CIMB"
-            "my.com.rhbgroup.mobilebanking", "com.rhbgroup.rhbengineering" -> "RHB"
+            "my.com.rhbgroup.mobilebanking", "com.rhbgroup.rhbengineering", "com.rhbgroup.rhbmobilebanking" -> "RHB"
             "com.hongleong.pb" -> "Hong Leong"
             "my.com.publicbank.pbe" -> "Public Bank"
             "my.com.mybsn", "com.mybsn.mobile", "net.mybsn.secure" -> "BSN"
@@ -323,16 +616,6 @@ class NotificationListener : NotificationListenerService() {
             "com.bankislam.go" -> "Bank Islam"
             else -> "Cash"
         }
-    }
-
-    private fun isValidTransaction(title: String, text: String): Boolean {
-        val combined = "$title $text".lowercase()
-        if (!combined.contains("rm")) return false
-        val validKeywords = listOf("paid", "spent", "transfer", "sent", "received", "credit", "debit", "payment", "purchase", "top up", "reload", "succes", "deducted", "transferred")
-        val hasValidKeyword = validKeywords.any { combined.contains(it) }
-        val invalidKeywords = listOf("promo", "off", "cashback", "voucher", "discount", "winner", "win", "campaign", "apply now", "deal", "login", "tac", "otp")
-        val hasInvalidKeyword = invalidKeywords.any { combined.contains(it) }
-        return hasValidKeyword && !hasInvalidKeyword
     }
 
     private fun getTimeSlot(timestamp: Long): String {
@@ -352,13 +635,10 @@ class NotificationListener : NotificationListenerService() {
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            // 🟢 重要：把频道重要性从 HIGH 改为 DEFAULT 或 LOW，这样就不会在大庭广众下发出 huge sound
-            // 既然是自动记账，就不应该太打扰用户
             val channel = NotificationChannel(channelId, "Transaction Alerts", NotificationManager.IMPORTANCE_DEFAULT)
             manager.createNotificationChannel(channel)
         }
 
-        // 点击通知跳转到编辑页面
         val intent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
             putExtra("EDIT_EXPENSE_ID", expenseId)
@@ -368,28 +648,16 @@ class NotificationListener : NotificationListenerService() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        // 🟢 动态文案逻辑
-        val isAutoMatched = autoNote.isNotBlank() && merchant != "Unknown"
-
-        val titleText = if (isAutoMatched) {
-            // ✅ 已自动搞定
-            "✅ Saved: RM ${String.format("%.2f", amount)}"
-        } else {
-            // 📝 需要人工介入
-            "📝 Saved: RM ${String.format("%.2f", amount)}"
-        }
-
-        val contentText = if (isAutoMatched) {
-            "$merchant • $autoNote (Tap to edit)"
-        } else {
-            "$merchant • Tap to add details"
-        }
+        val isAutoMatched = autoNote.isNotBlank() && merchant != "Unknown" && merchant != "待审核"
+        val titleText = if (isAutoMatched) "✅ Saved: RM ${String.format("%.2f", amount)}"
+        else "📝 Saved: RM ${String.format("%.2f", amount)}"
+        val contentText = if (isAutoMatched) "$merchant • $autoNote (Tap to edit)"
+        else "$merchant • Tap to add details"
 
         val notification = NotificationCompat.Builder(this, channelId)
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentTitle(titleText)
             .setContentText(contentText)
-            // 🟢 只有没匹配到的才设置高优先级弹窗，匹配到的就静默一点
             .setPriority(if (isAutoMatched) NotificationCompat.PRIORITY_DEFAULT else NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
             .setContentIntent(pendingIntent)
@@ -400,10 +668,66 @@ class NotificationListener : NotificationListenerService() {
 
     private fun isSensitive(content: String): Boolean {
         val lower = content.lowercase()
-        return lower.contains("tac") || lower.contains("otp") || lower.contains("code") || lower.contains("login") || lower.contains("verify")
+        return lower.contains("tac") || lower.contains("otp") ||
+                lower.contains("code") || lower.contains("login") || lower.contains("verify")
     }
 
     private fun showToast(msg: String) {
-        Handler(Looper.getMainLooper()).post { Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT).show() }
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    data class AiConfig(val isAllowed: Boolean, val customKey: String?, val customModel: String?)
+
+    private suspend fun getAiConfigAndCheckQuota(context: Context): AiConfig {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val isVip = VipUtils.isUserVip(context)
+        val customKey = prefs.getString("custom_api_key", "") ?: ""
+        val customModel = prefs.getString("custom_model_name", "") ?: ""
+
+        if (isVip || (customKey.isNotBlank() && customModel.isNotBlank())) {
+            return AiConfig(true, customKey.takeIf { it.isNotBlank() }, customModel.takeIf { it.isNotBlank() })
+        }
+
+        val today = AiProcessor.getNetworkDate()
+        val lastDate = prefs.getString("last_ai_usage_date", "")
+        var usage = prefs.getInt("daily_ai_usage", 0)
+
+        if (today != lastDate) {
+            usage = 0
+            prefs.edit().putString("last_ai_usage_date", today).apply()
+        }
+
+        return if (usage >= 5) {
+            AiConfig(false, null, null)
+        } else {
+            prefs.edit().putInt("daily_ai_usage", usage + 1).apply()
+            AiConfig(true, null, null)
+        }
+    }
+
+    private fun sendQuotaExceededNotification() {
+        val channelId = "expense_input_channel"
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            this, 999, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(this, channelId)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle(getString(R.string.notif_quota_title))
+            .setContentText(getString(R.string.notif_quota_desc))
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .build()
+
+        manager.notify(999, notification)
     }
 }

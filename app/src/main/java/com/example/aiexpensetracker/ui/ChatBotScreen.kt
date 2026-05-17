@@ -127,12 +127,16 @@ fun ChatBotScreen(
                                     "ADD" -> {
                                         val data = intentResult.addData
                                         if (data != null && data.amount != null && data.amount > 0) {
+
+                                            // 🟢 解析 AI 传回来的时间，如果解析失败再用当前时间兜底
+                                            val parsedTime = AiProcessor.parseDateTime(data.date ?: "", data.time ?: "") ?: System.currentTimeMillis()
+
                                             val newExpense = ExpenseEntity(
                                                 amount = data.amount,
                                                 merchant = data.merchant ?: "Unknown",
                                                 category = data.category ?: "Other",
                                                 type = data.type ?: "EXPENSE",
-                                                timestamp = System.currentTimeMillis(),
+                                                timestamp = parsedTime, // 🟢 替换原本的 System.currentTimeMillis()
                                                 originalText = userText,
                                                 note = data.note ?: "",
                                                 accountName = data.account ?: "Cash"
