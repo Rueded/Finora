@@ -38,22 +38,41 @@ object AiProcessor {
     ): TransactionResult? = withContext(Dispatchers.IO) {
         try {
             val prompt = """
-Role: Financial Data Extractor (Malaysia)
+Role: Financial Transaction Classifier & Data Extractor (Malaysia)
 
-Task: Extract transaction details from the text below.
+Task: First decide whether the text below reports a REAL, ALREADY-COMPLETED financial transaction on the user's own account/wallet. Only if it does, extract its details.
 Input Text: "$text"
 
 ==============================
-STRICT RULES (DATA EXTRACTION ONLY)
+STEP 1 — IS THIS A REAL TRANSACTION?
 ==============================
-IMPORTANT: This text has ALREADY been verified by the system as a VALID financial transaction.
-Do NOT evaluate whether it is valid or not. Your ONLY job is to extract the data.
-You MUST always return "valid": true.
+Return "valid": true ONLY if the text reports money that has ALREADY moved — a payment made, a transfer received, a deduction, a completed top-up.
 
+Return "valid": false for anything else, especially:
+- Promotions, discounts, cashback campaigns, "free for N days" offers, "tap to redeem/claim" pushes
+- Insurance or protection-plan adverts — even when they quote a ringgit figure, e.g. "coverage up to RM125,000". That figure is a coverage CEILING, not money that moved.
+- Balance reminders, upcoming-payment notices, or anything that hasn't happened yet
+- Login alerts, OTP/verification codes, app announcements, generic marketing of any kind
+
+A ringgit amount appearing in the text is NOT by itself proof of a transaction — ads and promos routinely quote specific amounts (coverage limits, discount caps, reward ceilings) with no real money moving at all. Ask yourself: did this amount actually get paid, received, or deducted — or is it just a number the marketing copy is quoting?
+
+Examples that must return "valid": false, "amount": 0:
+- "It's FREE for 30 Days! Protect your eWallet balance with coverage up to RM125,000. Tap to redeem!" (insurance ad; RM125,000 is a coverage ceiling)
+- "Get RM8 cashback on your next top-up of RM50 and above!" (promotional offer, nothing charged yet)
+- "Your balance is low. Top up now to avoid disruption." (reminder, no transaction)
+
+Examples that must return "valid": true and be extracted normally:
+- "Payment of RM9.90 to Grab successful."
+- "RM50.00 was transferred to Ahmad Bin Ali."
+- "You received RM1,200.00 from ALI BIN ABU."
+
+==============================
+STEP 2 — IF (AND ONLY IF) VALID, EXTRACT THE DATA
+==============================
 1. AMOUNT:
 - Extract the numeric amount only.
 - Examples: "MYR 0.01" → 0.01, "RM 9.90" → 9.90, "RM1,200.00" → 1200.00
-- Always return a positive number. Never return 0 unless truly no amount exists.
+- If invalid (Step 1), amount is always 0.
 
 2. TYPE:
 - Return "INCOME" if money came IN to the user (keywords: received, credited, inward, funds received, transferred to you, to your account, masuk, kredit).
@@ -64,7 +83,7 @@ You MUST always return "valid": true.
 - Extract the sender name (for INCOME) or recipient name (for EXPENSE).
 - For transfers to/from a person, extract the name even if partially masked (e.g., "A** B**").
 - For payments to businesses, extract the business name (e.g., "Grab", "Shopee", "TNG").
-- If truly no name exists → return "Unknown". NEVER return null or mark invalid.
+- If truly no name exists → return "Unknown".
 
 4. CATEGORY:
 Choose the best fit:
@@ -77,9 +96,105 @@ Choose the best fit:
 - Utilities: water, electric, tnb, syabas, telekom, unifi, celcom, maxis, digi
 - Other: personal transfers, unknown merchants, anything else
 
-5. OUTPUT FORMAT (CRITICAL):
+==============================
+OUTPUT FORMAT (CRITICAL)
+==============================
 - Return ONLY a raw JSON object. NO markdown. NO ```json. NO explanation. NO extra text.
 - First character of your response must be "{" and last must be "}".
+- If invalid, still return this exact shape with valid:false and amount:0.
+
+{
+  "valid": true,
+  "amount": 9.90,
+  "merchant": "ALI BIN ABU",
+  "category": "Other",
+  "type": "INCOME"
+}
+""".trimIndent()
+
+            val model = getModel(customApiKey, customModelName)
+            val response = model.generateContent(prompt)
+            val rawText = response.text
+                ?.replace("```json", "")
+                ?.replace("```", "")
+                ?.trim()
+
+            if (rawText != null) {
+                val json = JSONObject(rawText)
+                val isValid = json.optBoolean("valid", false)
+                val amount = json.optDouble("amount", 0.0)
+                // 🟢 恢复 AI 的真实否决权：之前这里无条件把 valid 写死成 true，
+                // 只要 amount>0 就入库——等于让 AI"提取"了数据却从来没人看它判断的真假，
+                // 保险广告里"coverage up to RM125k"这种数字也会被当成真实交易记进账本。
+                // 现在 valid 和 amount 都要满足，才当作真实交易；
+                // 否则返回 valid=false（而不是 null），这样 NotificationListener.kt 里
+                // 现成的 aiVetoed 判断才能正确把它当垃圾丢弃，而不是误触发"AI失败"的兜底路径。
+                if (isValid && amount > 0.0) {
+                    TransactionResult(
+                        valid = true,
+                        amount = amount,
+                        merchant = json.optString("merchant", "Unknown"),
+                        category = json.optString("category", "Other"),
+                        type = json.optString("type", "EXPENSE")
+                    )
+                } else {
+                    TransactionResult(
+                        valid = false,
+                        amount = 0.0,
+                        merchant = "Unknown",
+                        category = "Other",
+                        type = "EXPENSE"
+                    )
+                }
+            } else null
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Analysis Failed: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * 🟢 新增：专门给"从垃圾桶手动恢复"这个场景用的提取方法。
+     *
+     * 跟 analyze() 的关键区别：analyze() 会先判断"这是不是真实交易"，判断为否就拒绝——
+     * 这对自动监听流程是对的（自动流程没有人看着，需要 AI 把关广告/推广）。
+     * 但当用户在 IgnoredLogsScreen 里手动点了"恢复"，等于用户本人已经确认了
+     * "这确实是一笔真实交易"，这时候不该再让 AI 用同一套判断标准二次否决它
+     * （尤其是原本就是被 AI 判定为 SPAM 才进的垃圾桶，原样再问一次大概率还是被拒）。
+     * 这个方法只负责尽力提取金额/商户/分类，不做真假判断。
+     */
+    suspend fun extractForManualRecovery(
+        text: String,
+        customApiKey: String? = null,
+        customModelName: String? = null
+    ): TransactionResult? = withContext(Dispatchers.IO) {
+        try {
+            val prompt = """
+Role: Financial Data Extractor (Malaysia)
+
+Context: A human has already manually reviewed this text and confirmed it describes a real transaction they want recorded. Your ONLY job is to extract the data as best you can — do NOT judge whether it's valid, that decision has already been made by the user.
+Input Text: "$text"
+
+1. AMOUNT:
+- Extract the numeric amount only.
+- Examples: "MYR 0.01" → 0.01, "RM 9.90" → 9.90, "RM1,200.00" → 1200.00, "coverage up to RM125k" → 125000
+- If genuinely no number exists anywhere in the text, return 0.
+
+2. TYPE:
+- Return "INCOME" if money came IN to the user (received, credited, inward, masuk, kredit).
+- Return "EXPENSE" if money went OUT from the user (paid, spent, deducted, transferred, keluar, debit).
+- If unclear, default to "EXPENSE".
+
+3. MERCHANT:
+- Extract the sender name (INCOME) or recipient/business name (EXPENSE). If none exists, return "Unknown".
+
+4. CATEGORY:
+Choose the best fit: Food, Transport, Shopping, Entertainment, Medical, Salary, Utilities, Other.
+
+OUTPUT FORMAT (CRITICAL):
+- Return ONLY a raw JSON object. NO markdown. NO explanation.
+- Always return "valid": true — validity is not your decision here.
 
 {
   "valid": true,
@@ -100,7 +215,6 @@ Choose the best fit:
             if (rawText != null) {
                 val json = JSONObject(rawText)
                 val amount = json.optDouble("amount", 0.0)
-                // ✅ 剥夺 AI 的拒签权：只要 amount > 0 就入库，不再看 valid 的脸色
                 if (amount > 0.0) {
                     TransactionResult(
                         valid = true,
@@ -113,7 +227,7 @@ Choose the best fit:
             } else null
 
         } catch (e: Exception) {
-            Log.e(TAG, "Analysis Failed: ${e.message}")
+            Log.e(TAG, "Manual recovery extraction failed: ${e.message}")
             null
         }
     }

@@ -7,6 +7,15 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- 🟢 新增：枚举手机上已安装的 App，用于"监听 App 白名单"设置页。
+         不会弹权限请求框，也不需要 QUERY_ALL_PACKAGES 特批。 -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -31,7 +40,7 @@
 
         <service
             android:name=".service.NotificationListener"
-            android:label="AI Expense Listener"
+            android:label="@string/notification_listener_label"
             android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
             android:exported="true"
             android:foregroundServiceType="dataSync">

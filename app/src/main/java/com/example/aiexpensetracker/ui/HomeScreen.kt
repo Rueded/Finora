@@ -139,7 +139,7 @@ import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.*
 
-enum class AppScreen { Home, Stats, Budget, Learning, Logs, About, Subscriptions, Feedback, Premium }
+enum class AppScreen { Home, Stats, Budget, Learning, Logs, About, Subscriptions, Feedback, Premium, Whitelist }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -350,6 +350,7 @@ fun HomeScreen(
                                 AppScreen.Subscriptions -> stringResource(R.string.settings_subscriptions)
                                 AppScreen.Feedback -> stringResource(R.string.settings_feedback)
                                 AppScreen.Premium -> stringResource(R.string.settings_premium)
+                                AppScreen.Whitelist -> stringResource(R.string.whitelist_menu_title)
 
                             }
                             Text(titleText, style = MaterialTheme.typography.titleMedium)
@@ -517,6 +518,7 @@ fun HomeScreen(
                 )
                 AppScreen.Learning -> LearningListScreen(viewModel)
                 AppScreen.Logs -> IgnoredLogsScreen(viewModel)
+                AppScreen.Whitelist -> MonitoredAppsScreen(onBack = { currentScreen = AppScreen.Home })
                 AppScreen.About -> AboutScreen()
                 AppScreen.Subscriptions -> SubscriptionScreen(viewModel) { currentScreen = AppScreen.Home }
                 AppScreen.Feedback -> FeedbackScreen(viewModel = viewModel, onBack = { currentScreen = AppScreen.Home })
@@ -878,6 +880,16 @@ fun HomeScreen(
                     }
                 )
 
+                ListItem(
+                    headlineContent = { Text(stringResource(R.string.whitelist_menu_title)) },
+                    supportingContent = { Text(stringResource(R.string.whitelist_menu_subtitle)) },
+                    leadingContent = { Icon(Icons.Default.CheckCircle, null) },
+                    modifier = Modifier.clickable {
+                        currentScreen = AppScreen.Whitelist
+                        showSettingsSheet = false
+                    }
+                )
+
                 HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
 
                 Text("Data & About", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
@@ -955,7 +967,7 @@ fun HomeScreen(
             title = { Text(stringResource(R.string.settings_about)) },
             text = {
                 Column {
-                    Text("AI Expense Tracker", fontWeight = FontWeight.Bold)
+                    Text(stringResource(R.string.about_app_name), fontWeight = FontWeight.Bold)
                     Spacer(modifier = Modifier.height(8.dp))
                     Text("Developed by 白开水")
                     Spacer(modifier = Modifier.height(4.dp))
@@ -2015,7 +2027,18 @@ fun AddExpenseDialog(
         )
     }
 
-    if (showDatePicker) { val ds = rememberDatePickerState(initialSelectedDateMillis = displayDateMillis); DatePickerDialog(onDismissRequest = { showDatePicker = false }, confirmButton = { TextButton(onClick = { ds.selectedDateMillis?.let { displayDateMillis = it; calendar.timeInMillis = it }; showDatePicker = false }) { Text("OK") } }, dismissButton = { TextButton(onClick = { showDatePicker = false }) { Text("Cancel") } }) { DatePicker(state = ds) } }
+    if (showDatePicker) { val ds = rememberDatePickerState(initialSelectedDateMillis = displayDateMillis); DatePickerDialog(onDismissRequest = { showDatePicker = false }, confirmButton = { TextButton(onClick = {
+        // 🟢 修复"改日期时间跳到8点"：Compose DatePicker 的 selectedDateMillis 固定是所选日期在 UTC 时区的 0 点，
+        // 马来西亚是 UTC+8，如果直接拿它整个覆盖本地 calendar，换算成本地时间正好就是早上8点，还会把已经设好的时分丢掉。
+        // 这里改成只取出 UTC 时间里的"年/月/日"，套到本地 calendar 上，原来的时分秒保持不变。
+        ds.selectedDateMillis?.let { selectedMillis ->
+            val utcCal = Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply { timeInMillis = selectedMillis }
+            calendar.set(Calendar.YEAR, utcCal.get(Calendar.YEAR))
+            calendar.set(Calendar.MONTH, utcCal.get(Calendar.MONTH))
+            calendar.set(Calendar.DAY_OF_MONTH, utcCal.get(Calendar.DAY_OF_MONTH))
+            displayDateMillis = calendar.timeInMillis
+        }
+        showDatePicker = false }) { Text("OK") } }, dismissButton = { TextButton(onClick = { showDatePicker = false }) { Text("Cancel") } }) { DatePicker(state = ds) } }
     if (showTimePicker) { val ts = rememberTimePickerState(initialHour = calendar.get(Calendar.HOUR_OF_DAY), initialMinute = calendar.get(Calendar.MINUTE), is24Hour = true); AlertDialog(onDismissRequest = { showTimePicker = false }, confirmButton = { TextButton(onClick = { calendar.set(Calendar.HOUR_OF_DAY, ts.hour); calendar.set(Calendar.MINUTE, ts.minute); displayDateMillis = calendar.timeInMillis; showTimePicker = false }) { Text("OK") } }, dismissButton = { TextButton(onClick = { showTimePicker = false }) { Text("Cancel") } }, text = { TimePicker(state = ts) } ) }
     if (showNewCategoryDialog) {
         var newCat by remember { mutableStateOf("") }
@@ -2988,41 +3011,76 @@ fun DonutChart(stats: List<Float>, colors: List<Color>) {
 fun AboutScreen() {
     val context = LocalContext.current
     val prefs = context.getSharedPreferences("ai_tracker_prefs", Context.MODE_PRIVATE)
+    val scope = rememberCoroutineScope() // 🟢 Google 登录是挂起函数，需要协程作用域
 
     // 🟢 1. 新增：秘密后门状态变量
     var clickCount by remember { mutableStateOf(0) }
     var showDevBackdoor by remember { mutableStateOf(false) }
     var redeemCode by remember { mutableStateOf("") }
 
-    // 主体滚动内容
-    LazyColumn(
+    // 🟢 版本号改为从 PackageInfo 实时读取，不再手写死数字，以后升级版本不会忘记同步这里
+    val versionName = remember {
+        runCatching {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName
+        }.getOrNull() ?: "—"
+    }
+
+    // 🟢 这个页面专属的一套固定色板（不跟随系统深浅色切换）：
+    // 品牌识别色，跟 App 其他地方沿用的 MaterialTheme 主题色刻意区分开，
+    // 只在这一个"门面"页面出现，制造一个安静但清楚的记忆点。
+    val ink = Color(0xFF12151C)
+    val parchment = Color(0xFFF4F1E8)
+    val brass = Color(0xFFB8935A)
+
+    Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(16.dp)
+            .verticalScroll(rememberScrollState())
     ) {
-
-        // 1. App Header
-        item {
-            Icon(
-                Icons.Default.Home,
-                contentDescription = null,
-                modifier = Modifier.size(64.dp),
-                tint = MaterialTheme.colorScheme.primary
-            )
-            Spacer(modifier = Modifier.height(8.dp))
+        // ============ Hero：全出血品牌色板，全页唯一的高调元素 ============
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(ink)
+                .padding(vertical = 40.dp, horizontal = 24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(72.dp)
+                    .clip(CircleShape)
+                    .background(brass),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    "F",
+                    color = ink,
+                    fontSize = 32.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+            Spacer(modifier = Modifier.height(20.dp))
             Text(
                 text = stringResource(R.string.about_app_name),
-                style = MaterialTheme.typography.headlineMedium,
-                fontWeight = FontWeight.Bold
+                color = parchment,
+                fontSize = 30.sp,
+                fontWeight = FontWeight.SemiBold,
+                letterSpacing = (-0.5).sp
             )
-
-            // 🟢 2. 修改：加上了连击触发器！
+            Spacer(modifier = Modifier.height(6.dp))
             Text(
-                text = "v5.2.3",
-                style = MaterialTheme.typography.bodySmall,
-                color = Color.Gray,
+                text = stringResource(R.string.about_tagline),
+                color = parchment.copy(alpha = 0.7f),
+                style = MaterialTheme.typography.bodyMedium,
+                textAlign = TextAlign.Center
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // 🟢 2. 版本号连击触发器，逻辑不变，只是挪到了新的视觉位置
+            Text(
+                text = "v$versionName",
+                color = brass,
+                style = MaterialTheme.typography.labelMedium,
                 modifier = Modifier.clickable {
                     clickCount++
                     if (clickCount >= 5) {
@@ -3033,83 +3091,77 @@ fun AboutScreen() {
             )
         }
 
-        // 2. Credit Card (Design & AI)
-        item {
-            Card(
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
-                ),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(
-                    modifier = Modifier
-                        .padding(16.dp)
-                        .fillMaxWidth()
-                ) {
-                    // Design 部分
-                    Text(
-                        text = stringResource(R.string.about_design_label), // "Design & Integration by"
-                        style = MaterialTheme.typography.labelMedium,
-                        color = Color.Gray,
-                        modifier = Modifier.fillMaxWidth(),
-                        textAlign = TextAlign.Start
-                    )
-                    Text(
-                        text = "白开水 (Bai Kai Shui)",
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.fillMaxWidth(),
-                        textAlign = TextAlign.Start
-                    )
+        // ============ 正文：安静的分区，靠 hairline 分隔，不叠加卡片边框/阴影 ============
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp, vertical = 28.dp),
+            verticalArrangement = Arrangement.spacedBy(24.dp)
+        ) {
 
-                    Spacer(modifier = Modifier.height(12.dp))
-
-                    // AI 部分
-                    Text(
-                        text = stringResource(R.string.about_ai_label), // "AI-Assisted Code Generation"
-                        style = MaterialTheme.typography.labelMedium,
-                        color = Color.Gray,
-                        modifier = Modifier.fillMaxWidth(),
-                        textAlign = TextAlign.Start
-                    )
-                    Text(
-                        text = stringResource(R.string.about_ai_value), // "Powered by Google Gemini"
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.fillMaxWidth(),
-                        textAlign = TextAlign.Start
-                    )
-                }
+            // Built by
+            Column {
+                Text(
+                    text = stringResource(R.string.about_design_label), // "Built by"
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "白开水 (Bai Kai Shui)",
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.Medium
+                )
+                Text(
+                    text = stringResource(R.string.about_ai_label), // "with AI-assisted code generation"
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
-        }
 
-        // 3. Privacy Section (Privacy Title & Body)
-        item {
-            Text(
-                text = stringResource(R.string.about_privacy_title),
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.fillMaxWidth(),
-                textAlign = TextAlign.Start
-            )
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
 
-            Text(
-                text = stringResource(R.string.about_privacy_body), // 这里会在中文模式下显示双语
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.fillMaxWidth(),
-                textAlign = TextAlign.Start
-            )
-        }
+            // Privacy
+            Column {
+                Text(
+                    text = stringResource(R.string.about_privacy_title),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = stringResource(R.string.about_privacy_body), // 这里会在中文模式下显示双语
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
 
-        // Footer
-        item {
-            Spacer(modifier = Modifier.height(20.dp))
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+            // Powered by
+            Column {
+                Text(
+                    text = stringResource(R.string.about_tech_stack_label),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = stringResource(R.string.about_tech_stack_value),
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // Footer
             Text(
                 text = "© 2026 白开水. All Rights Reserved.\n(AI-assisted code integration)",
                 style = MaterialTheme.typography.labelSmall,
-                color = Color.Gray,
-                textAlign = TextAlign.Center
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth()
             )
         }
     }
@@ -3149,6 +3201,62 @@ fun AboutScreen() {
                             .remove("vip_expiry_time")     // 💥 关键：清空到期时间戳！
                             .apply()
                         Toast.makeText(context, "VIP Deactivated! Back to normal.", Toast.LENGTH_SHORT).show()
+
+                    } else if (code == "RECEIVER_ON") {
+                        // 🟢 暗号 3：把本机设为"收款验证设备"——改用 Google 账号登录 Firebase Auth，
+                        // App 里不再存任何密码/密钥。需要先在 Firebase Console 开通 Google 登录 + 填好 SHA-1。
+                        val activity = context as? android.app.Activity
+                        if (activity == null) {
+                            Toast.makeText(context, context.getString(R.string.receiver_no_activity), Toast.LENGTH_SHORT).show()
+                        } else {
+                            scope.launch {
+                                try {
+                                    val credentialManager = androidx.credentials.CredentialManager.create(activity)
+                                    val webClientId = context.getString(R.string.default_web_client_id)
+                                    val googleOption = com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
+                                        .Builder(webClientId)
+                                        .build()
+                                    val request = androidx.credentials.GetCredentialRequest.Builder()
+                                        .addCredentialOption(googleOption)
+                                        .build()
+
+                                    val response = credentialManager.getCredential(activity, request)
+                                    val cred = response.credential
+
+                                    if (cred is androidx.credentials.CustomCredential &&
+                                        cred.type == com.google.android.libraries.identity.googleid.GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL
+                                    ) {
+                                        val googleIdTokenCredential = com.google.android.libraries.identity.googleid.GoogleIdTokenCredential.createFrom(cred.data)
+                                        val firebaseCredential = com.google.firebase.auth.GoogleAuthProvider.getCredential(googleIdTokenCredential.idToken, null)
+
+                                        com.google.firebase.auth.FirebaseAuth.getInstance()
+                                            .signInWithCredential(firebaseCredential)
+                                            .addOnSuccessListener { authResult ->
+                                                prefs.edit().putBoolean("is_receiver_device", true).apply()
+                                                val label = authResult.user?.email ?: context.getString(R.string.receiver_google_account_fallback)
+                                                Toast.makeText(
+                                                    context,
+                                                    context.getString(R.string.receiver_on_success, label),
+                                                    Toast.LENGTH_LONG
+                                                ).show()
+                                            }
+                                            .addOnFailureListener { e ->
+                                                Toast.makeText(context, context.getString(R.string.receiver_firebase_login_failed, e.message ?: e.toString()), Toast.LENGTH_LONG).show()
+                                            }
+                                    } else {
+                                        Toast.makeText(context, context.getString(R.string.receiver_no_credential), Toast.LENGTH_LONG).show()
+                                    }
+                                } catch (e: Exception) {
+                                    Toast.makeText(context, context.getString(R.string.receiver_google_signin_failed, e.message ?: e.toString()), Toast.LENGTH_LONG).show()
+                                }
+                            }
+                        }
+
+                    } else if (code == "RECEIVER_OFF") {
+                        // 🔴 暗号 4：取消收款验证设备身份（比如手机丢了/换新机）
+                        com.google.firebase.auth.FirebaseAuth.getInstance().signOut()
+                        prefs.edit().putBoolean("is_receiver_device", false).apply()
+                        Toast.makeText(context, context.getString(R.string.receiver_off_success), Toast.LENGTH_SHORT).show()
 
                     } else {
                         // 错误暗号

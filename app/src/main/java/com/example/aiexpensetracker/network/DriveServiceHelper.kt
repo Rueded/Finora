@@ -15,12 +15,19 @@ class DriveServiceHelper(private val mDriveService: Drive) {
         private const val BACKUP_FILE_NAME = "expense_backup.zip"
     }
 
+    // 🟢 新增：记录最近一次失败的真实原因（异常信息），
+    // 之前 catch 块只 printStackTrace() 到 logcat，用户和上层代码完全看不到具体是什么错，
+    // 只会拿到一个 null，导致"备份/还原失败"跟"确实没有备份"这两种情况没法区分。
+    var lastError: String? = null
+        private set
+
     /**
      * 1. 上传 ZIP 文件
      * @param localZipFile 本地已打包好的 zip 文件
      */
     suspend fun uploadZipFile(localZipFile: java.io.File): String? = withContext(Dispatchers.IO) {
         try {
+            lastError = null
             // 先检查 Drive 上是否已有备份
             val fileId = searchFile(BACKUP_FILE_NAME)
 
@@ -45,6 +52,7 @@ class DriveServiceHelper(private val mDriveService: Drive) {
             }
         } catch (e: Exception) {
             e.printStackTrace()
+            lastError = e.message ?: e.javaClass.simpleName
             null
         }
     }
@@ -56,6 +64,7 @@ class DriveServiceHelper(private val mDriveService: Drive) {
      */
     suspend fun downloadZipFile(targetFile: java.io.File, fileId: String): Boolean = withContext(Dispatchers.IO) {
         try {
+            lastError = null
             val outputStream = FileOutputStream(targetFile)
             // 执行下载并将流写入 targetFile
             mDriveService.files().get(fileId).executeMediaAndDownloadTo(outputStream)
@@ -64,6 +73,7 @@ class DriveServiceHelper(private val mDriveService: Drive) {
             true
         } catch (e: Exception) {
             e.printStackTrace()
+            lastError = e.message ?: e.javaClass.simpleName
             false
         }
     }
@@ -73,6 +83,7 @@ class DriveServiceHelper(private val mDriveService: Drive) {
      */
     suspend fun searchFile(fileName: String): String? = withContext(Dispatchers.IO) {
         try {
+            lastError = null
             val result = mDriveService.files().list()
                 .setSpaces("appDataFolder")
                 .setQ("name = '$fileName' and trashed = false")
@@ -82,6 +93,7 @@ class DriveServiceHelper(private val mDriveService: Drive) {
             if (result.files.isNotEmpty()) result.files[0].id else null
         } catch (e: Exception) {
             e.printStackTrace()
+            lastError = e.message ?: e.javaClass.simpleName
             null
         }
     }

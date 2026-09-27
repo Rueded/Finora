@@ -16,8 +16,8 @@ android {
         applicationId = "com.example.aiexpensetracker"
         minSdk = 26
         targetSdk = 36
-        versionCode = 25
-        versionName = "5.2.3"
+        versionCode = 26
+        versionName = "6.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -49,7 +49,20 @@ android {
         }
     }
 
+    // 🟢 新增：AiExpenseTracker 专属签名钥匙，跟其他项目/App 的 debug keystore 区分开
+    signingConfigs {
+        create("customDebug") {
+            storeFile = file("../aiexpensetracker-debug.keystore")
+            storePassword = "1596357"
+            keyAlias = "aiexpensetracker"
+            keyPassword = "1596357"
+        }
+    }
+
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("customDebug")
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(
@@ -123,6 +136,12 @@ dependencies {
     // Firebase
     implementation(platform("com.google.firebase:firebase-bom:34.9.0"))
     implementation("com.google.firebase:firebase-database")
+    implementation("com.google.firebase:firebase-auth") // 🟢 收款验证设备登录用
+
+    // 🟢 Google 登录（Credential Manager，Google 官方现行推荐做法，取代已弃用的 play-services-auth 旧登录流程）
+    implementation("androidx.credentials:credentials:1.3.0")
+    implementation("androidx.credentials:credentials-play-services-auth:1.3.0")
+    implementation("com.google.android.libraries.identity.googleid:googleid:1.1.1")
 
     // Testing
     testImplementation(libs.junit)

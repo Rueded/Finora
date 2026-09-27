@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">AI Expense Tracker</string>
+    <string name="app_name">Finora</string>
     <string name="app_title">AI Smart Tracker (RM)</string>
     <string name="stats_title">Statistics</string>
     <string name="service_running">🟢 Service Running</string>
@@ -115,11 +115,41 @@
     <string name="btn_yes_add">Yes, Add</string>
     <string name="btn_no">No</string>
     <string name="about_title">AI Expense Tracker v1.0</string>
-    <string name="about_app_name">AI Expense Tracker</string>
-    <string name="about_design_label">Design &amp; Integration by</string>
-    <string name="about_ai_label">AI-Assisted Code Generation</string>
+    <string name="about_app_name">Finora</string>
+    <string name="about_design_label">Built by</string>
+    <string name="about_ai_label">with AI-assisted code generation</string>
     <string name="about_ai_value">Powered by Google Gemini</string>
     <string name="about_privacy_title">Data Transparency &amp; Privacy</string>
     <string name="about_privacy_body">This app prioritizes your privacy. All financial data (transactions, balances, and history) is stored locally on your device using an encrypted database.\n\n1. Notification Processing:\nNotifications are processed locally on-device. Only relevant text content required for transaction analysis is sent to AI.\n\n2. No Cloud Storage:\nNo personal financial data is stored on any server. Uninstalling the app removes all local data unless exported by the user.\n\n3. AI Assistance:\nAI is used solely as a supportive tool for transaction detection and classification. Personalization rules remain stored on-device.</string>
     <string name="about_desc">Design &amp; Integration by\n白开水 (Bai Kai Shui)\n\nAI-Assisted Code Generation\nPowered by Google Gemini\n\nData Transparency &amp; Privacy\nThis app prioritizes your privacy. All financial data is stored locally. No cloud servers.</string>
+
+    <!-- 🟢 Monitored Apps whitelist screen -->
+    <string name="notification_listener_label">Finora Notification Listener</string>
+    <string name="whitelist_menu_title">Monitored Apps</string>
+    <string name="whitelist_menu_subtitle">Choose which apps\' notifications to read</string>
+    <string name="whitelist_intro_title">Select the banks / wallet apps to monitor</string>
+    <string name="whitelist_intro_body">Only notifications from checked apps are read and analyzed. Common banks/wallets are pre-checked for you. If a specific app never produces a record, come back here to confirm it\'s checked and its package name hasn\'t changed.</string>
+    <string name="whitelist_search_hint">Search app name or package</string>
+    <string name="whitelist_reset_desc">Restore default bank list</string>
+    <string name="whitelist_selected_count">%1$d apps selected</string>
+
+    <!-- 🟢 Receiver device (Google sign-in) flow -->
+    <string name="receiver_no_activity">Couldn\'t get Activity, please retry</string>
+    <string name="receiver_on_success">✅ Set as receiver device using %1$s</string>
+    <string name="receiver_google_account_fallback">Google account</string>
+    <string name="receiver_firebase_login_failed">Firebase login failed: %1$s</string>
+    <string name="receiver_no_credential">No Google credential received</string>
+    <string name="receiver_google_signin_failed">Google sign-in failed or cancelled: %1$s</string>
+    <string name="receiver_off_success">Receiver device status cancelled</string>
+
+    <!-- 🟢 Drive backup/restore error detail -->
+    <string name="backup_upload_failed">❌ Backup upload failed: %1$s</string>
+    <string name="restore_search_failed">❌ Couldn\'t check Drive: %1$s</string>
+    <string name="restore_no_backup_found">❌ No backup found in Drive.</string>
+    <string name="restore_download_failed">❌ Download failed: %1$s</string>
+
+    <!-- 🟢 About screen redesign -->
+    <string name="about_tagline">Every ringgit, quietly accounted for.</string>
+    <string name="about_tech_stack_label">Powered by</string>
+    <string name="about_tech_stack_value">Google Gemini · Google Drive · Firebase</string>
 </resources>

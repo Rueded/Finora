@@ -19,5 +19,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "AiExpenseTracker"
+rootProject.name = "Finora"
 include(":app")

@@ -28,6 +28,7 @@ import com.example.aiexpensetracker.database.ExpenseEntity
 import com.example.aiexpensetracker.database.IgnoredEntity
 import com.example.aiexpensetracker.network.AiProcessor
 import com.example.aiexpensetracker.network.TransactionResult
+import com.example.aiexpensetracker.utils.MonitoredAppsUtils
 import com.example.aiexpensetracker.utils.VipUtils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -43,6 +44,7 @@ class NotificationListener : NotificationListenerService() {
         private const val ACTION_STOP_SERVICE = "com.example.aiexpensetracker.STOP_SERVICE"
         private const val PREFS_NAME = "ai_tracker_prefs"
         private const val KEY_TRACKING_ENABLED = "tracking_enabled"
+        const val KEY_IS_RECEIVER_DEVICE = "is_receiver_device" // 🟢 是否为"收款验证设备"（只有老板自己的手机该为 true）
 
         private const val MATCH_WINDOW_MS = 2 * 60 * 1000L
         private const val DEDUP_WINDOW_MS = 10_000L
@@ -60,26 +62,8 @@ class NotificationListener : NotificationListenerService() {
             Regex("Transfer to (.*?) of RM\\s?(\\d+\\.\\d{2}) is successful", RegexOption.IGNORE_CASE) // CIMB
         )
 
-        private val TARGET_PACKAGES = setOf(
-            "my.com.tngdigital.ewallet", "com.grabtaxi.passenger", "com.shopee.my", "com.shopeepay.my",
-            "my.com.myboost", "com.airasia.bigpay", "com.maybank2u.life", "com.cimb.octo",
-            "com.cimb.clicks.android", "my.com.rhbgroup.mobilebanking", "my.com.rhbgroup.rhbmobilebanking",
-            "com.rhbgroup.rhbengineering", "com.rhbgroup.rhbmobilebanking", "com.hongleong.pb",
-            "my.com.mybsn", "com.mybsn.mobile", "net.mybsn.secure", "com.ambank.ambank",
-            "my.com.publicbank.pbe", "com.alliancebank.allianceonline", "com.bankislam.go",
-            "com.bankrakyat.irakyat", "com.sc.breeze.my", "my.com.hsbc.hsbcmobilebanking",
-            "com.ocbc.mobile", "com.uob.mighty.my", "com.maybank2u.m2u", "com.cimb.cimbocto",
-            "com.cimbmalaysia", "my.com.rhb.mobilebanking", "my.com.hongleongconnect.mobile",
-            "com.publicbank.pbengage", "com.ambank.ambankonline", "com.ambank.amonline",
-            "com.alliance.online.mobile", "com.bankislam.bimbmobile", "my.com.bankrakyat.irakyat",
-            "com.affinbank.affinalways", "com.affinonline.rib", "com.uob.tmrw.my", "com.ocbc.my",
-            "com.ocbc.mobilebanking.my", "hk.com.hsbc.hsbcmalaysia", "com.htsu.hsbcpersonalbanking",
-            "com.standardchartered.breeze.my", "my.gxbank.my", "my.com.aeonbank.app",
-            "com.bankislam.beu", "com.alrajhi.rize", "com.tpa.airasiacard", "com.setel.mobile",
-            "com.aeoncredit.wallet.my", "com.lazada.android", "com.google.android.apps.walletnfcrel",
-            "com.samsung.android.spay", "com.paypal.android.p2pmobile", "com.transferwise.android",
-            "com.eg.android.AlipayGphone"
-        )
+        // 🟢 原 TARGET_PACKAGES 已迁移到 MonitoredAppsUtils.DEFAULT_TARGET_PACKAGES，
+        // 现在改为运行时读取用户在"监听 App 白名单"设置页里自选的列表
     }
 
     private var isServiceRunning = true
@@ -185,7 +169,9 @@ class NotificationListener : NotificationListenerService() {
 
         val currentPostTime = sbn.postTime
         val packageName = sbn.packageName
-        if (!TARGET_PACKAGES.contains(packageName)) return
+        // 🟢 改为读取用户在"监听 App 白名单"设置页自选的包名集合（首次运行会自动用预置银行列表初始化）
+        val monitoredPackages = MonitoredAppsUtils.getMonitoredPackages(applicationContext)
+        if (!monitoredPackages.contains(packageName)) return
 
         val extras = sbn.notification.extras
         var title = extras.getString(android.app.Notification.EXTRA_TITLE)
@@ -209,38 +195,46 @@ class NotificationListener : NotificationListenerService() {
 
         // ==========================================
         // VIP 自动发卡雷达
+        // 🟢 只在"收款验证设备"（你自己在 About 页用暗号 RECEIVER_ON 激活过的设备）上触发。
+        // 普通用户的手机即使收到金额刚好撞上 VIP 价位的转账，也只是走下面的正常记账流程，
+        // 不会再往 Firebase 上传通知原文，也不会被错误记成 "VIP Subscription"。
         // ==========================================
-        val amountRegex = Regex("RM\\s*(\\d+(\\.\\d{1,2})?)")
-        val amountMatch = amountRegex.find(fullContent)
-        val earnedAmount = amountMatch?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0
+        val isReceiverDevice = prefs.getBoolean(KEY_IS_RECEIVER_DEVICE, false)
+        if (isReceiverDevice) {
+            val amountRegex = Regex("RM\\s*(\\d+(\\.\\d{1,2})?)")
+            val amountMatch = amountRegex.find(fullContent)
+            val earnedAmount = amountMatch?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0
 
-        val vipPrices = setOf(9.90, 89.90, 199.00)
-        val isVipPrice = vipPrices.any { Math.abs(earnedAmount - it) < 0.001 }
+            val vipPrices = setOf(9.90, 89.90, 199.00)
+            val isVipPrice = vipPrices.any { Math.abs(earnedAmount - it) < 0.001 }
 
-        val isIncoming = fullContent.containsAny("RECEIVED", "TOYOU", "CREDITED", "FROM", "收款", "入账", "收到")
-        val isOutgoing = fullContent.containsAny("YOU'VETRANSFERRED", "PAID", "SPENT", "PAYMENTTO", "付款", "转出", "支付")
+            val isIncoming = fullContent.containsAny("RECEIVED", "TOYOU", "CREDITED", "FROM", "收款", "入账", "收到")
+            val isOutgoing = fullContent.containsAny("YOU'VETRANSFERRED", "PAID", "SPENT", "PAYMENTTO", "付款", "转出", "支付")
 
-        if (isVipPrice && isIncoming && !isOutgoing) {
-            Log.d("AutoDelivery", "🎯 嗅探到真实的 VIP 商业收款: $fullContent")
-            val database = com.google.firebase.database.FirebaseDatabase.getInstance("https://ai-expense-tracker-0-default-rtdb.asia-southeast1.firebasedatabase.app/")
-            database.goOnline()
-            val receiptData = mapOf("text" to fullContent, "timestamp" to currentTime, "claimed" to false)
-            database.getReference("global_payments/history").push().setValue(receiptData)
+            if (isVipPrice && isIncoming && !isOutgoing) {
+                Log.d("AutoDelivery", "🎯 嗅探到真实的 VIP 商业收款: $fullContent")
+                // 需要先在 About 页用 RECEIVER_ON 暗号以管理员账号登录过 Firebase Auth，
+                // 否则这里的写入会被新的 Firebase 安全规则拒绝（见 database.rules.json）
+                val database = com.google.firebase.database.FirebaseDatabase.getInstance("https://ai-expense-tracker-0-default-rtdb.asia-southeast1.firebasedatabase.app/")
+                database.goOnline()
+                val receiptData = mapOf("text" to fullContent, "timestamp" to currentTime, "claimed" to false)
+                database.getReference("global_payments/history").push().setValue(receiptData)
 
-            CoroutineScope(Dispatchers.IO).launch {
-                try {
-                    val db = AppDatabase.getDatabase(applicationContext)
-                    val detectedAccount = detectAccountName(packageName)
-                    val vipIncome = ExpenseEntity(
-                        amount = earnedAmount, type = "INCOME", merchant = "VIP Subscription",
-                        category = getString(R.string.category_business_income), timestamp = currentTime,
-                        originalText = "Auto-detected VIP Payment: $fullContent",
-                        note = getString(R.string.note_auto_vip_income), accountName = detectedAccount
-                    )
-                    dbMutex.withLock { db.expenseDao().insert(vipIncome) }
-                } catch (e: Exception) { Log.e("AutoDelivery", "记账失败", e) }
+                CoroutineScope(Dispatchers.IO).launch {
+                    try {
+                        val db = AppDatabase.getDatabase(applicationContext)
+                        val detectedAccount = detectAccountName(packageName)
+                        val vipIncome = ExpenseEntity(
+                            amount = earnedAmount, type = "INCOME", merchant = "VIP Subscription",
+                            category = getString(R.string.category_business_income), timestamp = currentTime,
+                            originalText = "Auto-detected VIP Payment: $fullContent",
+                            note = getString(R.string.note_auto_vip_income), accountName = detectedAccount
+                        )
+                        dbMutex.withLock { db.expenseDao().insert(vipIncome) }
+                    } catch (e: Exception) { Log.e("AutoDelivery", "记账失败", e) }
+                }
+                return
             }
-            return
         }
         // ==========================================
 
@@ -263,16 +257,30 @@ class NotificationListener : NotificationListenerService() {
             }
         }
 
+        // 🟢 评分器职责改变：不再负责判定"是不是真实交易"，只负责最基本的硬拒绝（完全没有货币金额）。
+        // 命中指纹的走绝杀通道；没命中指纹但只要检测到货币金额，一律放行给 AI 做最终判断——
+        // AI 本来就是这条流水线里最准的一层，不该被关键词打分器挡在门外。
+        var filterScore = 0
         if (is100PercentReal && preExtractedAmount > 0) {
             Log.d(TAG, "🎯 Perfect Signature Match: RM $preExtractedAmount. Bypassing score filter.")
         } else {
-            // ✅ 没有命中指纹，才走评分制过滤器
-            val filterScore = calcFilterScore(title, text)
-            // 🟢 修改这里：门槛降到 2 分！只要有 RM + successful 就能过！
-            if (filterScore < 2) {
-                Log.d(TAG, "🗑️ Score=$filterScore, ignored: $title")
-                saveIgnoredLog(packageName, title, text, "Score Filter (score=$filterScore)")
+            filterScore = calcFilterScore(title, text)
+            if (filterScore <= -99) {
+                // 硬拒绝原因1：连 RM/MYR/令吉/马币这类货币标识都没有，肯定不是交易通知
+                Log.d(TAG, "🗑️ No currency detected, ignored: $title")
+                saveIgnoredLog(packageName, title, text, "No currency detected")
                 return
+            }
+            if (filterScore == -98) {
+                // 硬拒绝原因2：命中了明显的广告/推广固定短语（哪怕带着货币金额，比如
+                // "coverage up to RM125k"），直接当广告丢弃，不浪费一次 AI 调用
+                Log.d(TAG, "🗑️ Obvious ad phrase detected, ignored: $title")
+                saveIgnoredLog(packageName, title, text, "Obvious ad/promo phrase detected")
+                return
+            }
+            if (filterScore < 2) {
+                // 分数低不再直接丢弃，只记一条日志方便你事后复盘哪些低分消息其实是真交易
+                Log.d(TAG, "⚠️ Score=$filterScore (low confidence), forwarding to AI anyway: $title")
             }
         }
 
@@ -531,6 +539,17 @@ class NotificationListener : NotificationListenerService() {
         // 1. 必须有货币符号，否则直接枪毙
         val hasCurrency = combined.containsAny("rm", "myr", "令吉", "马币")
         if (!hasCurrency) return -99
+
+        // 1.5 🟢 新增：明显是广告/推广文案的固定短语，直接枪毙，省一次 AI 调用。
+        // 这几个短语组合基本只会出现在营销文案里（"coverage up to RM125k. Tap to redeem!"
+        // 这类保险广告就是典型例子），真实的交易确认消息不会这样写。
+        // 这是独立于 AI 判断之外的第二道防线，AI 偶尔判断失误时还有这一层兜底。
+        val obviousAdPhrases = listOf(
+            "tap to redeem", "claim your", "coverage up to", "protect your", "free for",
+            "limited time offer", "t&cs apply", "terms and conditions apply",
+            "领取奖励", "点击领取", "限时优惠", "保障最高", "保额最高"
+        )
+        if (obviousAdPhrases.any { combined.contains(it) }) return -98
 
         // 2. 强正向词 (明确的支出行为) +4 分
         val highPositive = listOf(
